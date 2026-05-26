@@ -9,15 +9,20 @@ from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+from pypdf import PdfReader
 
-# ── STEP 1: LOAD ──────────────────────────────
-# Read the file with plain Python — no deprecated packages needed
-with open("dental_faq.txt", "r", encoding="utf-8") as f:
-    text = f.read()
+# ── STEP 1: LOAD PDF ──────────────────────────
+# PdfReader opens the PDF and reads each page separately
+# We extract the text from every page and join it into one string
+reader = PdfReader("document.pdf")
+text = ""
+for page in reader.pages:
+    text += page.extract_text()
 
 # Wrap in a Document object (LangChain's standard format: text + metadata)
-documents = [Document(page_content=text, metadata={"source": "dental_faq.txt"})]
-print(f"Loaded {len(documents)} document(s)")
+# metadata "source" tells us where the text came from — useful later when showing sources
+documents = [Document(page_content=text, metadata={"source": "document.pdf"})]
+print(f"Loaded {len(reader.pages)} pages from PDF")
 
 # ── STEP 2: SPLIT INTO CHUNKS ─────────────────
 # chunk_size=500  → max 500 characters per chunk
