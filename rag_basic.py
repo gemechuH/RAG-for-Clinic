@@ -117,7 +117,7 @@ while True:
         preview = chunk.page_content[:120].replace("\n", " ")
         print(f"  [{i+1}] {source} -> \"{preview}...\"")
 
-    print("\n" + "─" * 50 + "\n")
+    print("\n" + "-" * 50 + "\n")
 
 
 # ── STEP 8: ASK QUESTIONS ─────────────────────
