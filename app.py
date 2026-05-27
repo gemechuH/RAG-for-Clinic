@@ -1,4 +1,5 @@
 import os
+import json
 import shutil
 import streamlit as st
 from dotenv import load_dotenv
@@ -12,8 +13,29 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 load_dotenv()
-
 os.makedirs("docs", exist_ok=True)
+
+TRACKER = "indexed_files.json"
+
+def get_indexed_files():
+    # Returns the set of filenames already embedded in the vector store
+    if os.path.exists(TRACKER):
+        with open(TRACKER) as f:
+            return set(json.load(f))
+    return set()
+
+def save_indexed_files(files):
+    with open(TRACKER, "w") as f:
+        json.dump(list(files), f)
+
+def pdf_to_chunks(filepath, filename):
+    reader = PdfReader(filepath)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text()
+    doc = Document(page_content=text, metadata={"source": filename})
+    splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=80)
+    return splitter.split_documents([doc])
 
 st.set_page_config(page_title="RAG Chat", page_icon="📄")
 st.title("📄 Chat with your Documents")
@@ -21,46 +43,63 @@ st.title("📄 Chat with your Documents")
 # ── SIDEBAR ───────────────────────────────────
 st.sidebar.title("Documents")
 
-# File uploader — accepts multiple PDFs at once
 uploaded_files = st.sidebar.file_uploader(
     "Upload PDF files",
     type="pdf",
     accept_multiple_files=True
 )
 
-# When files are uploaded, save them to docs/ and trigger a rebuild
 if uploaded_files:
+    indexed = get_indexed_files()
     new_files = []
     for file in uploaded_files:
         save_path = f"docs/{file.name}"
-        if not os.path.exists(save_path):
+        if file.name not in indexed:
             with open(save_path, "wb") as f:
                 f.write(file.read())
             new_files.append(file.name)
 
-    # If any new files were saved, delete the old vector store so it rebuilds
     if new_files:
-        if os.path.exists("chroma_db_ui"):
-            shutil.rmtree("chroma_db_ui")
+        # Add new docs to existing store without deleting it — avoids Windows file lock
+        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        vectorstore = Chroma(
+            persist_directory="chroma_db_ui",
+            embedding_function=embeddings
+        )
+        for filename in new_files:
+            chunks = pdf_to_chunks(f"docs/{filename}", filename)
+            vectorstore.add_documents(chunks)
+            indexed.add(filename)
+
+        save_indexed_files(indexed)
         st.sidebar.success(f"Added: {', '.join(new_files)}")
-        st.cache_resource.clear()  # clear cached RAG so load_rag() runs again
+        st.cache_resource.clear()
         st.rerun()
 
-# Show all current documents in sidebar
+# Show indexed documents in sidebar
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Indexed documents:**")
-pdf_files = [f for f in os.listdir("docs") if f.endswith(".pdf")]
-if pdf_files:
-    for f in pdf_files:
+indexed_files = get_indexed_files()
+if indexed_files:
+    for f in sorted(indexed_files):
         st.sidebar.caption(f"- {f}")
 else:
     st.sidebar.caption("No documents yet. Upload a PDF above.")
 
-# Rebuild button — forces re-index of all docs
+# Rebuild button — two step to avoid Windows file lock:
+# Step 1: set flag + clear cache → releases ChromaDB connection
+# Step 2: on next run, see the flag → now safe to delete
 if st.sidebar.button("Rebuild Index"):
+    st.session_state.pending_rebuild = True
+    st.cache_resource.clear()
+    st.rerun()
+
+if st.session_state.get("pending_rebuild"):
     if os.path.exists("chroma_db_ui"):
         shutil.rmtree("chroma_db_ui")
-    st.cache_resource.clear()
+    if os.path.exists(TRACKER):
+        os.remove(TRACKER)
+    st.session_state.pending_rebuild = False
     st.rerun()
 
 # ── LOAD RAG (cached) ─────────────────────────
@@ -75,34 +114,28 @@ def load_rag():
         )
         st.sidebar.info("Vector store loaded from disk")
     else:
-        documents = []
-        for filename in os.listdir("docs"):
-            if filename.endswith(".pdf"):
-                reader = PdfReader(f"docs/{filename}")
-                text = ""
-                for page in reader.pages:
-                    text += page.extract_text()
-                documents.append(Document(
-                    page_content=text,
-                    metadata={"source": filename}
-                ))
-
-        if not documents:
+        pdf_files = [f for f in os.listdir("docs") if f.endswith(".pdf")]
+        if not pdf_files:
             return None, None
 
-        splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=80)
-        chunks = splitter.split_documents(documents)
+        all_chunks = []
+        indexed = set()
+        for filename in pdf_files:
+            chunks = pdf_to_chunks(f"docs/{filename}", filename)
+            all_chunks.extend(chunks)
+            indexed.add(filename)
 
         vectorstore = Chroma.from_documents(
-            documents=chunks,
+            documents=all_chunks,
             embedding=embeddings,
             persist_directory="chroma_db_ui"
         )
-        st.sidebar.info(f"Built index from {len(documents)} document(s)")
+        save_indexed_files(indexed)
+        st.sidebar.info(f"Built index from {len(pdf_files)} document(s)")
 
     retriever = vectorstore.as_retriever(
         search_type="mmr",
-        search_kwargs={"k": 3, "fetch_k": 10}
+        search_kwargs={"k": 5, "fetch_k": 15}
     )
     llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
     return retriever, llm
@@ -143,7 +176,7 @@ def format_history(messages):
         history += f"{role}: {m['content']}\n"
     return history
 
-# ── CHAT HISTORY ──────────────────────────────
+# ── CHAT ──────────────────────────────────────
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -155,7 +188,6 @@ for message in st.session_state.messages:
                 for s in message["sources"]:
                     st.caption(s)
 
-# ── CHAT INPUT ────────────────────────────────
 if retriever is None:
     st.info("Upload a PDF from the sidebar to get started.")
 else:
@@ -178,7 +210,6 @@ else:
 
                 retrieved_chunks = retriever.invoke(standalone_question)
                 context = format_docs(retrieved_chunks)
-
                 answer = (
                     answer_prompt | llm | StrOutputParser()
                 ).invoke({"context": context, "question": standalone_question})
