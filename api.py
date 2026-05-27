@@ -3,18 +3,17 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.embeddings import Embeddings
 from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from fastembed import TextEmbedding
 
 load_dotenv()
 
 app = FastAPI()
 
-# CORS allows any website to call this API
-# Without this, browsers block requests from other domains
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,9 +21,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load vector store and LLM once when server starts
+class FastEmbedWrapper(Embeddings):
+    def __init__(self):
+        self.model = TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
+
+    def embed_documents(self, texts):
+        return [list(v) for v in self.model.embed(texts)]
+
+    def embed_query(self, text):
+        return list(list(self.model.embed([text]))[0])
+
 print("Loading vector store...")
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+embeddings = FastEmbedWrapper()
 vectorstore = Chroma(
     persist_directory="chroma_db_prod",
     embedding_function=embeddings
@@ -50,14 +58,10 @@ def format_docs(docs):
 
 print("API ready.")
 
-# ── ROUTES ────────────────────────────────────
-
-# Health check — Render calls this to verify the server is alive
 @app.get("/")
 def health_check():
     return {"status": "RAG API is running"}
 
-# This is the endpoint any website calls to ask a question
 class AskRequest(BaseModel):
     question: str
 
@@ -65,14 +69,8 @@ class AskRequest(BaseModel):
 def ask(request: AskRequest):
     chunks = retriever.invoke(request.question)
     context = format_docs(chunks)
-
     answer = (
         answer_prompt | llm | StrOutputParser()
     ).invoke({"context": context, "question": request.question})
-
     sources = list(set(chunk.metadata["source"] for chunk in chunks))
-
-    return {
-        "answer": answer,
-        "sources": sources
-    }
+    return {"answer": answer, "sources": sources}
